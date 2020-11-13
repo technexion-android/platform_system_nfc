@@ -24,6 +24,7 @@ cc_library_shared {
         "android.hardware.nfc@1.0",
         "android.hardware.nfc@1.1",
         "android.hardware.nfc@1.2",
+        "vendor.nxp.nxpnfc@1.0",
     ],
     static_libs: [
         "libnfcutils",
@@ -33,6 +34,7 @@ cc_library_shared {
         "-Wall",
         "-Werror",
         "-Wimplicit-fallthrough",
+        "-DNXP_EXTNS=TRUE",
     ],
     local_include_dirs: [
         "include",

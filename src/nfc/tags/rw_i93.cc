@@ -15,6 +15,25 @@
  *  limitations under the License.
  *
  ******************************************************************************/
+/******************************************************************************
+ *
+ *  The original Work has been changed by NXP Semiconductors.
+ *
+ *  Copyright (C) 2020 NXP Semiconductors
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
 
 /******************************************************************************
  *
@@ -480,7 +499,7 @@ void rw_i93_send_to_upper(NFC_HDR* p_resp) {
       /* This STM tag supports more than 2040 bytes */
       p_i93->intl_flags |= RW_I93_FLAG_16BIT_NUM_BLOCK;
       p_i93->state = RW_I93_STATE_BUSY;
-    } else if (length) {
+    } else {
       /* notify error to upper layer */
       rw_data.i93_cmd_cmpl.status = NFC_STATUS_FAILED;
       rw_data.i93_cmd_cmpl.command = p_i93->sent_cmd;
@@ -3166,8 +3185,12 @@ static void rw_i93_data_cback(__attribute__((unused)) uint8_t conn_id,
       p_i93->state = RW_I93_STATE_IDLE;
       p_i93->sent_cmd = 0;
 
-      /* if any response, send presence check with ok */
-      rw_data.status = NFC_STATUS_OK;
+      /* depending of response length, send presence check with ok or failed */
+      if (p_resp->len > 1) {
+        rw_data.status  = NFC_STATUS_OK;
+      } else {
+        rw_data.status  = NFC_STATUS_FAILED;
+      }
       (*(rw_cb.p_cback))(RW_I93_PRESENCE_CHECK_EVT, &rw_data);
       GKI_freebuf(p_resp);
       break;

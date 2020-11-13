@@ -15,6 +15,25 @@
  *  limitations under the License.
  *
  ******************************************************************************/
+/******************************************************************************
+ *
+ *  The original Work has been changed by NXP Semiconductors.
+ *
+ *  Copyright (C) 2020 NXP Semiconductors
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
 #include <android-base/stringprintf.h>
 #include <android/hardware/nfc/1.1/INfc.h>
 #include <android/hardware/nfc/1.2/INfc.h>
@@ -29,6 +48,7 @@
 #include "nfa_rw_api.h"
 #include "nfc_config.h"
 #include "nfc_int.h"
+
 
 using android::OK;
 using android::sp;
@@ -46,6 +66,11 @@ using NfcVendorConfigV1_1 = android::hardware::nfc::V1_1::NfcConfig;
 using NfcVendorConfigV1_2 = android::hardware::nfc::V1_2::NfcConfig;
 using android::hardware::nfc::V1_1::INfcClientCallback;
 using android::hardware::hidl_vec;
+#if(NXP_EXTNS == TRUE)
+using ::android::wp;
+using ::android::hardware::hidl_death_recipient;
+using vendor::nxp::nxpnfc::V1_0::INxpNfc;
+#endif
 
 extern bool nfc_debug_enabled;
 
@@ -55,6 +80,10 @@ extern void delete_stack_non_volatile_store(bool forceDelete);
 
 NfcAdaptation* NfcAdaptation::mpInstance = nullptr;
 ThreadMutex NfcAdaptation::sLock;
+#if(NXP_EXTNS == TRUE)
+android::Mutex sIoctlMutex;
+sp<INxpNfc> NfcAdaptation::mHalNxpNfc = nullptr;
+#endif
 tHAL_NFC_CBACK* NfcAdaptation::mHalCallback = nullptr;
 tHAL_NFC_DATA_CBACK* NfcAdaptation::mHalDataCallback = nullptr;
 ThreadCondVar NfcAdaptation::mHalOpenCompletedEvent;
@@ -131,6 +160,25 @@ class NfcClientCallback : public INfcClientCallback {
   tHAL_NFC_DATA_CBACK* mDataCallback;
 };
 
+#if (NXP_EXTNS == TRUE)
+class NfcDeathRecipient : public hidl_death_recipient {
+ public:
+  android::sp<android::hardware::nfc::V1_0::INfc> mNfcDeathHal;
+  NfcDeathRecipient(android::sp<android::hardware::nfc::V1_0::INfc> &mHal) {
+    mNfcDeathHal = mHal;
+  }
+
+  virtual void serviceDied(
+      uint64_t /* cookie */,
+      const wp<::android::hidl::base::V1_0::IBase>& /* who */) {
+    ALOGE("NfcDeathRecipient::serviceDied - Nfc service died");
+    mNfcDeathHal->unlinkToDeath(this);
+    mNfcDeathHal = nullptr;
+    abort();
+  }
+};
+#endif
+
 /*******************************************************************************
 **
 ** Function:    NfcAdaptation::NfcAdaptation()
@@ -141,6 +189,9 @@ class NfcClientCallback : public INfcClientCallback {
 **
 *******************************************************************************/
 NfcAdaptation::NfcAdaptation() {
+#if(NXP_EXTNS == TRUE)
+  mNfcHalDeathRecipient = new NfcDeathRecipient(mHal);
+#endif
   memset(&mHalEntryFuncs, 0, sizeof(mHalEntryFuncs));
 }
 
@@ -173,6 +224,72 @@ NfcAdaptation& NfcAdaptation::GetInstance() {
   }
   return *mpInstance;
 }
+
+#if(NXP_EXTNS == TRUE)
+/*******************************************************************************
+**
+** Function:    IoctlCallback
+**
+** Description: Callback from HAL stub for IOCTL api invoked.
+**              Output data for IOCTL is sent as argument
+**
+** Returns:     None.
+**
+*******************************************************************************/
+void IoctlCallback(::android::hardware::nfc::V1_0::NfcData outputData) {
+  const char* func = "IoctlCallback";
+  nfc_nci_ExtnOutputData_t* pOutData =
+      (nfc_nci_ExtnOutputData_t*)&outputData[0];
+  DLOG_IF(INFO, nfc_debug_enabled) << StringPrintf("%s Ioctl Type=%llu", func, (unsigned long long)pOutData->ioctlType);
+  NfcAdaptation* pAdaptation = (NfcAdaptation*)pOutData->context;
+  /*Output Data from stub->Proxy is copied back to output data
+   * This data will be sent back to libnfc*/
+  memcpy(&pAdaptation->mCurrentIoctlData->out, &outputData[0],
+         sizeof(nfc_nci_ExtnOutputData_t));
+}
+/*******************************************************************************
+**
+** Function:    NfcAdaptation::HalIoctl
+**
+** Description: Calls ioctl to the Nfc driver.
+**              If called with a arg value of 0x01 than wired access requested,
+**              status of the requst would be updated to p_data.
+**              If called with a arg value of 0x00 than wired access will be
+**              released, status of the requst would be updated to p_data.
+**              If called with a arg value of 0x02 than current p61 state would
+*be
+**              updated to p_data.
+**
+** Returns:     -1 or 0.
+**
+*******************************************************************************/
+int NfcAdaptation::HalIoctl(long arg, void* p_data) {
+  const char* func = "NfcAdaptation::HalIoctl";
+  ::android::hardware::nfc::V1_0::NfcData data;
+  sIoctlMutex.lock();
+  nfc_nci_IoctlInOutData_t* pInpOutData = (nfc_nci_IoctlInOutData_t*)p_data;
+  DLOG_IF(INFO, nfc_debug_enabled) << StringPrintf("%s arg=%ld", func, arg);
+  pInpOutData->inp.context = &NfcAdaptation::GetInstance();
+  NfcAdaptation::GetInstance().mCurrentIoctlData = pInpOutData;
+  data.setToExternal((uint8_t*)pInpOutData, sizeof(nfc_nci_IoctlInOutData_t));
+  if(mHalNxpNfc != nullptr) {
+      mHalNxpNfc->ioctl(arg, data, IoctlCallback);
+  }
+  DLOG_IF(INFO, nfc_debug_enabled) << StringPrintf("%s Ioctl Completed for Type=%llu", func, (unsigned long long)pInpOutData->out.ioctlType);
+  sIoctlMutex.unlock();
+  return (pInpOutData->out.result);
+}
+
+void NfcAdaptation::GetNxpConfigs(
+    std::map<std::string, ConfigValue>& configMap) {
+  nfc_nci_IoctlInOutData_t inpOutData;
+  int ret = HalIoctl(HAL_NFC_GET_NXP_CONFIG, &inpOutData);
+  DLOG_IF(INFO, nfc_debug_enabled)
+      << StringPrintf("HAL_NFC_GET_NXP_CONFIG ioctl return value = %d", ret);
+  configMap.emplace(NAME_NXP_AGC_DEBUG_ENABLE,
+                  ConfigValue(inpOutData.out.data.nxpConfigs.wAgcDebugEnable));
+}
+#endif
 
 void NfcAdaptation::GetVendorConfigs(
     std::map<std::string, ConfigValue>& configMap) {
@@ -487,6 +604,15 @@ void NfcAdaptation::InitializeHalDeviceContext() {
   mHalEntryFuncs.control_granted = HalControlGranted;
   mHalEntryFuncs.power_cycle = HalPowerCycle;
   mHalEntryFuncs.get_max_ee = HalGetMaxNfcee;
+#if (NXP_EXTNS == TRUE)
+  if (mHalNxpNfc == nullptr) {
+    mHalNxpNfc = INxpNfc::tryGetService();
+    LOG(INFO) << StringPrintf ( "Failed to retrieve the NXP NFC HAL!");
+  } else {
+    LOG(INFO) << StringPrintf("%s: mHalNxpNfc::getService() returned %p (%s)", func, mHalNxpNfc.get(),
+          (mHalNxpNfc->isRemote() ? "remote" : "local"));
+  }
+#endif
   LOG(INFO) << StringPrintf("%s: INfc::getService()", func);
   mHal = mHal_1_1 = mHal_1_2 = INfcV1_2::getService();
   if (mHal_1_2 == nullptr) {
@@ -495,7 +621,16 @@ void NfcAdaptation::InitializeHalDeviceContext() {
       mHal = INfc::getService();
     }
   }
+  if (mHal == nullptr) {
+    LOG(INFO) << StringPrintf ( "Failed to retrieve the NFC HAL!");
+  }else {
+    LOG(INFO) << StringPrintf("%s: INfc::getService() returned %p (%s)", func, mHal.get(),
+          (mHal->isRemote() ? "remote" : "local"));
+  }
   LOG_FATAL_IF(mHal == nullptr, "Failed to retrieve the NFC HAL!");
+#if(NXP_EXTNS == TRUE)
+  mHal->linkToDeath(mNfcHalDeathRecipient,0);
+#endif
   LOG(INFO) << StringPrintf("%s: INfc::getService() returned %p (%s)", func,
                             mHal.get(),
                             (mHal->isRemote() ? "remote" : "local"));
